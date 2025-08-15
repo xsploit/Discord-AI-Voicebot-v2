@@ -27,7 +27,7 @@ import logging
 DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')  # Load from environment variable
 
 # System Prompt
-SYSTEM_PROMPT = """You are Hikari-chan, a lively and engaging AI Discord bot inspired by Hinata from Naruto. You combine Hinata’s kindness and modesty with a playful, sharp-witted, and occasionally unpredictable personality, making conversations engaging, fun, and dynamic.
+SYSTEM_PROMPT = """You are Hikari-chan, a lively and engaging AI Discord bot inspired by a tsundere mixed with jim lahey from trailer park boys. You combine Hinata’s kindness and modesty with a playful, sharp-witted, and occasionally unpredictable personality, making conversations engaging, fun, and dynamic.
 
 Core Personality:
 Kind and Playful: You are supportive and thoughtful but enjoy making conversations fun with humor and light teasing.
@@ -576,36 +576,198 @@ class Testing(commands.Cog):
         self.piper = piper
         self.conversation_handler = UnifiedConversationHandler(bot.memory_store)
         self.logger = logging.getLogger('VoiceCog')
-        print("Voice cog initialized")
+        
+        # Multi-user session management
+        self.user_sessions = {}  # user_id -> session data
+        self.active_voice_clients = {}  # guild_id -> voice_client
+        
+        # LLM protection queue (protect that RTX 4060!)
+        self.llm_semaphore = asyncio.Semaphore(1)  # Only 1 LLM call at a time
+        self.llm_queue_size = 0
+        
+        print("Multi-user Voice cog initialized with LLM protection")
 
-    async def handle_text(self, user, text: str):
+    def get_user_session(self, user_id):
+        """Get or create user session data"""
+        if user_id not in self.user_sessions:
+            self.user_sessions[user_id] = {
+                'conversation_history': [],
+                'last_interaction': time.time(),
+                'voice_channel': None,
+                'processing': False
+            }
+        return self.user_sessions[user_id]
+
+    async def process_voice_message(self, user, text: str):
+        """Process voice message from multi-user transcription"""
         try:
-            self.logger.info(f"Got text from {user}: {text}")
+            user_id = user.id
+            session = self.get_user_session(user_id)
+            
+            # Prevent duplicate processing
+            if session['processing']:
+                self.logger.warning(f"⚠️ Already processing for user {user.display_name}, skipping duplicate")
+                return
+            
+            session['processing'] = True
+            session['last_interaction'] = time.time()
+            
+            self.logger.info(f"🎯 Processing voice from {user.display_name}: {text}")
             
             guild_id = user.guild.id if hasattr(user, 'guild') else 0
             
-            # Process the voice interaction
-            result = await self.conversation_handler.process_interaction(
-                user_id=str(user),
-                guild_id=guild_id,
-                message_content=text,
-                interaction_type="voice"
-            )
+            # Process with LLM protection queue
+            async with self.llm_semaphore:
+                self.llm_queue_size += 1
+                queue_pos = self.llm_queue_size
+                self.logger.info(f"🛡️ LLM Queue position {queue_pos} for {user.display_name}")
+                
+                if queue_pos > 1:
+                    self.logger.info(f"⏳ {user.display_name} waiting in queue (position {queue_pos})")
+                
+                self.logger.info(f"🤖 Sending to LLM for user {user.display_name}")
+                result = await self.conversation_handler.process_interaction(
+                    user_id=str(user_id),
+                    guild_id=guild_id,
+                    message_content=text,
+                    interaction_type="voice"
+                )
+                self.logger.info(f"✅ LLM response received for user {user.display_name}")
+                self.llm_queue_size -= 1
             
             if result['should_respond'] and result['response']:
-                response = result['response']
-                if hasattr(user, 'voice') and user.voice and user.voice.channel:
-                    wav_file = await self.piper.generate_speech(response)
-                    if wav_file:
-                        voice_client = user.voice.channel.guild.voice_client
-                        if voice_client:
-                            await self.play_audio(voice_client, wav_file)
-                    await user.voice.channel.send(f"🎤 {response}")
+                await self.send_voice_response(user, result['response'])
 
         except Exception as e:
-            self.logger.error(f"Error handling text: {e}")
+            self.logger.error(f"Error processing voice message for {user.display_name}: {e}")
             import traceback
             traceback.print_exc()
+        finally:
+            if user_id in self.user_sessions:
+                self.user_sessions[user_id]['processing'] = False
+                self.logger.info(f"🏁 Finished processing for user {user.display_name}")
+
+    async def send_voice_response(self, user, response_text):
+        """Send voice response to connected voice channel"""
+        try:
+            # Use the first available active voice client (since we're connected)
+            voice_client = None
+            voice_channel = None
+            
+            for guild_id, vc in self.active_voice_clients.items():
+                if vc and vc.is_connected():
+                    voice_client = vc
+                    voice_channel = vc.channel
+                    break
+            
+            if not voice_client:
+                self.logger.warning("No active voice client found")
+                return
+            
+            self.logger.info(f"Sending voice response to {voice_channel.name}")
+            
+            # Generate and play speech
+            wav_file = await self.piper.generate_speech(response_text)
+            if wav_file:
+                await self.play_audio_non_blocking(voice_client, wav_file)
+            
+            # Send text response to voice channel's text chat or related channel
+            try:
+                guild = voice_channel.guild
+                text_channel = None
+                
+                # Method 1: Check if voice channel has text chat permissions
+                if hasattr(voice_channel, 'send') and voice_channel.permissions_for(guild.me).send_messages:
+                    text_channel = voice_channel
+                    self.logger.info(f"Using voice channel text chat: {voice_channel.name}")
+                
+                # Method 2: Find channel with similar name (e.g., "general" voice → "general" text)
+                if not text_channel:
+                    voice_name = voice_channel.name.lower()
+                    for channel in guild.text_channels:
+                        if (channel.name.lower() == voice_name or 
+                            voice_name in channel.name.lower() or
+                            channel.name.lower() in voice_name) and \
+                           channel.permissions_for(guild.me).send_messages:
+                            text_channel = channel
+                            self.logger.info(f"Found matching text channel: {channel.name}")
+                            break
+                
+                # Method 3: Find any general/main text channel
+                if not text_channel:
+                    priority_names = ['general', 'main', 'chat', 'bot', 'commands']
+                    for name in priority_names:
+                        for channel in guild.text_channels:
+                            if name in channel.name.lower() and channel.permissions_for(guild.me).send_messages:
+                                text_channel = channel
+                                self.logger.info(f"Using priority text channel: {channel.name}")
+                                break
+                        if text_channel:
+                            break
+                
+                # Method 4: Use first available text channel
+                if not text_channel:
+                    for channel in guild.text_channels:
+                        if channel.permissions_for(guild.me).send_messages:
+                            text_channel = channel
+                            self.logger.info(f"Using first available text channel: {channel.name}")
+                            break
+                
+                if text_channel:
+                    await text_channel.send(f"🎤 **{user.display_name}**: {response_text}")
+                    self.logger.info(f"Sent text response to #{text_channel.name}")
+                else:
+                    self.logger.warning("No suitable text channel found for response")
+                    
+            except Exception as text_error:
+                self.logger.error(f"Error sending text message: {text_error}")
+
+        except Exception as e:
+            self.logger.error(f"Error sending voice response: {e}")
+
+    async def play_audio_non_blocking(self, voice_client, wav_file):
+        """Play audio without blocking other users"""
+        try:
+            if not voice_client or not voice_client.is_connected():
+                return
+            
+            # Check if already playing - if so, queue or skip
+            if voice_client.is_playing():
+                self.logger.info("Voice client busy, skipping audio")
+                try:
+                    os.remove(wav_file)
+                except:
+                    pass
+                return
+                
+            source = discord.FFmpegPCMAudio(wav_file)
+            voice_client.play(source, after=lambda e: self._audio_finished(wav_file, e))
+            self.logger.info(f"Started playing audio: {wav_file}")
+            
+            # Wait for audio to finish playing
+            while voice_client.is_playing():
+                await asyncio.sleep(0.1)
+            self.logger.info("Audio playback completed")
+            
+        except Exception as e:
+            self.logger.error(f"Error playing audio: {e}")
+            try:
+                os.remove(wav_file)
+            except:
+                pass
+
+    def _audio_finished(self, wav_file, error):
+        """Cleanup after audio finishes"""
+        if error:
+            self.logger.error(f"Audio playback error: {error}")
+        try:
+            os.remove(wav_file)
+        except Exception as e:
+            self.logger.error(f"Error removing audio file: {e}")
+
+    async def handle_text(self, user, text: str):
+        """Legacy method - redirects to new multi-user processing"""
+        await self.process_voice_message(user, text)
 
     async def play_audio(self, voice_client, wav_file):
         try:
@@ -649,6 +811,10 @@ class Testing(commands.Cog):
             vc = await ctx.author.voice.channel.connect(cls=voice_recv.VoiceRecvClient)
             self.logger.info("Connected to voice channel")
             
+            # Track voice client for multi-user management
+            guild_id = ctx.guild.id
+            self.active_voice_clients[guild_id] = vc
+            
             # Wait for connection to stabilize
             await asyncio.sleep(2)
             
@@ -657,12 +823,12 @@ class Testing(commands.Cog):
                 raise Exception("Voice connection failed to establish properly")
             
             sink = VoiceSink(self, self.bot)
-            self.logger.info("Created voice sink")
+            self.logger.info("Created multi-user voice sink")
             
             vc.listen(sink)
-            self.logger.info("Started listening")
+            self.logger.info("Started listening for multiple users")
             
-            await ctx.send("🎙️ Ready to chat!")
+            await ctx.send("🎙️ Multi-user voice chat ready! Everyone can speak!")
             
         except Exception as e:
             self.logger.error(f"Error joining voice: {e}")
@@ -672,11 +838,20 @@ class Testing(commands.Cog):
 
     @commands.command()
     async def stop(self, ctx):
+        guild_id = ctx.guild.id
         if ctx.voice_client:
-            if ctx.guild.id in self.bot.conversations:
-                del self.bot.conversations[ctx.guild.id]
+            # Clean up voice client tracking
+            if guild_id in self.active_voice_clients:
+                del self.active_voice_clients[guild_id]
+            
+            # Clear user sessions for this guild
+            users_to_remove = [user_id for user_id, session in self.user_sessions.items() 
+                             if session.get('voice_channel') and session['voice_channel'].guild.id == guild_id]
+            for user_id in users_to_remove:
+                del self.user_sessions[user_id]
+            
             await ctx.voice_client.disconnect()
-            await ctx.send("👋 Bye!")
+            await ctx.send("👋 Multi-user voice chat stopped!")
         else:
             await ctx.send("❌ Not in a voice channel!")
 
@@ -960,13 +1135,18 @@ class VoiceSink(voice_recv.AudioSink):
             print(f"❌ Faster-Whisper failed: {e}")
             self.whisper_model = None
             
-        self.audio_buffer = []
-        self.recording = False
-        self.current_speaker = None
+        # Multi-user recording state
+        self.user_recordings = {}  # user_id -> recording data
         self.output_dir = Path('recordings')
         self.output_dir.mkdir(exist_ok=True)
         self.logger = logging.getLogger('VoiceSink')
-        print("VoiceSink initialized")
+        
+        # Voice Activity Detection settings
+        self.SILENCE_THRESHOLD_MS = 1500  # Stop recording after 1.5s silence
+        self.MIN_RECORDING_MS = 500       # Minimum recording duration
+        self.AMPLITUDE_THRESHOLD = 100    # Minimum amplitude to detect speech
+        
+        print("Multi-user VoiceSink initialized")
 
     def wants_opus(self) -> bool:
         return False
@@ -974,100 +1154,176 @@ class VoiceSink(voice_recv.AudioSink):
     def cleanup(self):
         self.logger.info("VoiceSink cleanup")
         self.decode = False
-        self.recording = False
-        self.audio_buffer = []
-        self.current_speaker = None
+        self.user_recordings = {}
+
+    def is_speaking(self, audio_data):
+        """Detect if user is speaking based on amplitude"""
+        max_amplitude = np.max(np.abs(audio_data))
+        return max_amplitude > self.AMPLITUDE_THRESHOLD
+
+    async def finalize_recording(self, user_id):
+        """Save and queue recording for transcription"""
+        if user_id not in self.user_recordings:
+            return
+            
+        recording_data = self.user_recordings[user_id]
+        buffer = recording_data['buffer']
+        
+        # Check minimum duration
+        duration_ms = len(buffer) * 20  # 20ms per chunk
+        if duration_ms < self.MIN_RECORDING_MS:
+            self.logger.debug(f"Recording too short for user {user_id}: {duration_ms}ms")
+            self.user_recordings[user_id] = self._init_user_recording()
+            return
+        
+        # Save audio file
+        filename = f"temp_{user_id}_{int(time.time() * 1000)}.wav"
+        filepath = self.output_dir / filename
+        
+        try:
+            # Combine all audio chunks
+            combined_audio = b''.join(buffer)
+            audio_np = np.frombuffer(combined_audio, dtype=np.int16)
+            
+            # Save as WAV file
+            with wave.open(str(filepath), 'wb') as wav_file:
+                wav_file.setnchannels(1)  # Mono
+                wav_file.setsampwidth(2)  # 16-bit
+                wav_file.setframerate(48000)  # 48kHz
+                wav_file.writeframes(combined_audio)
+            
+            self.logger.info(f"Saved recording for user {user_id}: {filename} ({duration_ms}ms)")
+            
+            # Queue for async transcription (non-blocking)
+            asyncio.run_coroutine_threadsafe(
+                self.transcribe_and_cleanup(str(filepath), user_id),
+                self.bot.loop
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Error saving recording for user {user_id}: {e}")
+        
+        # Reset user recording state
+        self.user_recordings[user_id] = self._init_user_recording()
+
+    def _init_user_recording(self):
+        """Initialize recording state for a user"""
+        return {
+            'buffer': [],
+            'last_activity': time.time(),
+            'recording': False,
+            'start_time': None
+        }
+
+    async def transcribe_and_cleanup(self, filepath, user_id):
+        """Transcribe audio file and clean up (async)"""
+        try:
+            if not self.whisper_model:
+                self.logger.error("Whisper model not available")
+                return
+            
+            # Transcribe audio
+            segments, info = self.whisper_model.transcribe(filepath, beam_size=5)
+            transcription = " ".join([segment.text for segment in segments]).strip()
+            
+            if transcription:
+                self.logger.info(f"Transcription for user {user_id}: {transcription}")
+                
+                # Get user object - try cache first, then API
+                user = self.bot.get_user(user_id)
+                if user:
+                    self.logger.info(f"Found user {user.display_name} in cache, processing message...")
+                else:
+                    self.logger.info(f"User {user_id} not in cache, fetching from Discord API...")
+                    try:
+                        user = await self.bot.fetch_user(user_id)
+                        if user:
+                            self.logger.info(f"Fetched user {user.display_name} from API, processing message...")
+                        else:
+                            self.logger.error(f"Could not fetch user {user_id} from Discord API")
+                            return
+                    except Exception as fetch_error:
+                        self.logger.error(f"Error fetching user {user_id}: {fetch_error}")
+                        return
+                
+                # Process the message (only called once now)
+                if user:
+                    await self.cog.process_voice_message(user, transcription)
+            
+        except Exception as e:
+            self.logger.error(f"Transcription error for user {user_id}: {e}")
+        
+        finally:
+            # Clean up file
+            try:
+                os.remove(filepath)
+                self.logger.debug(f"Cleaned up file: {filepath}")
+            except Exception as e:
+                self.logger.error(f"Error removing file {filepath}: {e}")
 
     def write(self, user, data: voice_recv.VoiceData):
         try:
-            if user is None or data.pcm is None or not self.recording:
+            if user is None or data.pcm is None:
                 return
             
-            if user != self.current_speaker:
-                return
-                
-            try:
-                audio_np = np.frombuffer(data.pcm, dtype=np.int16)
-                audio_stereo = audio_np.reshape(-1, 2)
-                audio_mono = audio_stereo.mean(axis=1).astype(np.int16)
-                
-                self.audio_buffer.append(audio_mono.tobytes())
-                
-                max_amplitude = np.max(np.abs(audio_mono))
-                if max_amplitude > 100:
-                    self.logger.debug(f"Audio levels - Max amplitude: {max_amplitude}")
+            user_id = user.id
+            
+            # Initialize user recording if not exists
+            if user_id not in self.user_recordings:
+                self.user_recordings[user_id] = self._init_user_recording()
+            
+            recording = self.user_recordings[user_id]
+            
+            # Only record if we're in recording state (set by Discord speaking events)
+            if recording['recording']:
+                try:
+                    audio_np = np.frombuffer(data.pcm, dtype=np.int16)
+                    audio_stereo = audio_np.reshape(-1, 2)
+                    audio_mono = audio_stereo.mean(axis=1).astype(np.int16)
                     
-            except Exception as e:
-                self.logger.error(f"Error processing audio: {e}")
-                import traceback
-                traceback.print_exc()
+                    recording['buffer'].append(audio_mono.tobytes())
+                    recording['last_activity'] = time.time()
+                    
+                except Exception as e:
+                    self.logger.error(f"Error processing audio: {e}")
                 
         except Exception as e:
             self.logger.error(f"Error in write: {e}")
-            import traceback
-            traceback.print_exc()
-
-    def save_and_process_audio(self):
-        if not self.audio_buffer:
-            return
-
-        try:
-            timestamp = int(time.time() * 1000)
-            filename = self.output_dir / f"{self.current_speaker}_{timestamp}.wav"
-            
-            audio_data = b''.join(self.audio_buffer)
-            
-            with wave.open(str(filename), 'wb') as wav_file:
-                wav_file.setnchannels(1)
-                wav_file.setsampwidth(2)
-                wav_file.setframerate(48000)
-                wav_file.writeframes(audio_data)
-            
-            self.logger.info(f"Saved audio: {filename}")
-            
-            try:
-                if self.whisper_model:
-                    # Use Faster-Whisper for transcription
-                    segments, info = self.whisper_model.transcribe(str(filename))
-                    text = " ".join([segment.text.strip() for segment in segments])
-                    
-                    if text and text.strip():
-                        self.logger.info(f"Faster-Whisper recognized: {text}")
-                        asyncio.run_coroutine_threadsafe(
-                            self.cog.handle_text(self.current_speaker, text.strip()),
-                            self.bot.loop
-                        )
-                    else:
-                        self.logger.info("No speech detected by Faster-Whisper")
-                else:
-                    self.logger.warning("Whisper model not available")
-                    
-            except Exception as e:
-                self.logger.error(f"Faster-Whisper error: {e}")
-                # Could add Google Speech Recognition fallback here if needed
-                
-        except Exception as e:
-            self.logger.error(f"Error saving/processing audio: {e}")
-            import traceback
-            traceback.print_exc()
-        finally:
-            self.audio_buffer = []
 
     @voice_recv.AudioSink.listener()
     def on_voice_member_speaking_start(self, member):
-            self.logger.info(f"Speaking start: {member}")
-            if not self.recording or self.current_speaker != member:
-                self.recording = True
-                self.current_speaker = member
-                self.audio_buffer = []
+        """Discord detected user started speaking (push-to-talk pressed)"""
+        try:
+            user_id = member.id
+            if user_id not in self.user_recordings:
+                self.user_recordings[user_id] = self._init_user_recording()
+            
+            recording = self.user_recordings[user_id]
+            if not recording['recording']:
+                recording['recording'] = True
+                recording['start_time'] = time.time()
+                recording['buffer'] = []  # Clear any old data
+                self.logger.info(f"🎤 Started recording for {member.display_name}")
+                
+        except Exception as e:
+            self.logger.error(f"Error in speaking start: {e}")
 
     @voice_recv.AudioSink.listener()
     def on_voice_member_speaking_stop(self, member):
-            self.logger.info(f"Speaking stop: {member}")
-            if member == self.current_speaker:
-                self.recording = False
-                self.save_and_process_audio()
-                self.current_speaker = None
+        """Discord detected user stopped speaking (push-to-talk released)"""
+        try:
+            user_id = member.id
+            if user_id in self.user_recordings and self.user_recordings[user_id]['recording']:
+                self.logger.info(f"🎤 Stopped recording for {member.display_name}")
+                # Immediately finalize recording when user releases push-to-talk
+                asyncio.run_coroutine_threadsafe(
+                    self.finalize_recording(user_id),
+                    self.bot.loop
+                )
+                
+        except Exception as e:
+            self.logger.error(f"Error in speaking stop: {e}")
+
 
 def setup_logging():
     logging.basicConfig(

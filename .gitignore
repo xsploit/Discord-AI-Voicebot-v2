@@ -1,0 +1,106 @@
+# Discord AI Voicebot - .gitignore
+
+# Security - Never commit tokens or keys
+*.env
+.env
+config.json
+*token*
+*secret*
+*key*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+.env/
+
+# AI/ML Models and data
+
+waifu_memory/
+*.faiss
+
+# Audio files
+output/
+recordings/
+*.wav
+*.mp3
+*.ogg
+*.flac
+*.m4a
+
+# Logs
+*.log
+logs/
+discord_bot.log
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Windows
+desktop.ini
+$RECYCLE.BIN/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.pkl
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# PyTorch
+*.pth
+*.pt
+
+# Temporary files
+temp/
+tmp/
+*.tmp
+*.temp
+
+# Piper TTS (optional - uncomment if you want to exclude)
+# piper/
+# *.exe
+
+# Package files
+*.tar.gz
+*.zip
+*.rar
+discord_bot.log
+.claude/settings.local.json
+discord_bot.log
+discord_bot.log

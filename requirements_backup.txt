@@ -1,0 +1,26 @@
+# Discord AI Voicebot Requirements
+# Updated August 2025 - Includes 4006 voice fix + GPU acceleration
+
+# Core Discord libraries (with 4006 voice fix)
+git+https://github.com/Rapptz/discord.py@13432591c6a7b095cb8daec687667c69a3469d95
+git+https://github.com/imayhaveborkedit/discord-ext-voice-recv
+
+# Core dependencies
+ollama>=0.4.5
+sentence-transformers>=3.0.0
+faiss-cpu>=1.9.0
+numpy>=1.24.0
+aiohttp>=3.8.0
+faster-whisper>=1.2.0
+python-dotenv>=1.0.0
+
+# GPU-accelerated processing (CUDA recommended for speed)
+torch>=2.0.0
+torchaudio>=2.0.0
+transformers>=4.30.0
+
+# For GPU acceleration install PyTorch with CUDA:
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+
+# Built-in Python modules (for reference)
+# pathlib, asyncio, logging, pickle, json, datetime, subprocess, time, base64, os, typing

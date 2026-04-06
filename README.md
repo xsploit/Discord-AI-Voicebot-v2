@@ -166,6 +166,7 @@ If `sentence-transformers`, `torch`, or `torchvision` are mismatched, the bot no
 - `doctor_bot.py`: environment verification script
 - `.env.example`: example provider config
 - `requirements.txt`: primary install file
+- `exact_requirements.txt`: optional exact pin reference
 
 ## License
 

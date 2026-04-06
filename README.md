@@ -1,151 +1,142 @@
-# Discord AI Voicebot - Hikari-chan
+# Discord AI Voicebot v2
 
-**UPDATE (August 2025)**: Fixed Discord 4006 voice connection errors with latest discord.py version!
+Current repo state: April 6, 2026.
 
-This is a **Discord bot** that combines **AI chat, voice recognition, and TTS** into one intelligent assistant. Meet **Hikari-chan** - an AI with Hinata's personality that can chat via text or voice, remember conversations, and respond with natural speech.
+This repo is the Discord bot in `Main.py`, using LM Studio for the LLM and Inworld streaming TTS for low-latency replies, with Piper as fallback.
 
-## Features:
-- 🤖 **AI-Powered Chat**: Uses LM Studio's OpenAI-compatible local server for intelligent responses
-- 🎙️ **Voice Recognition**: Listens to voice chat and responds naturally  
-- 🔊 **Text-to-Speech**: Uses Inworld streaming TTS for low-latency voice replies, with Piper fallback
-- 🧠 **Memory System**: Remembers past conversations for context
-- 💬 **Text & Voice**: Works in both text channels and voice channels
-- 🎯 **Smart Responses**: Only responds when mentioned or in voice chat
+## 2026 Status
 
----
+What is current in this repo now:
+
+- `discord.py` and `discord-ext-voice-recv` were updated to current upstream commits
+- LM Studio is the primary LLM backend
+- Inworld websocket TTS is the primary speech backend
+- Piper remains available as a local fallback TTS backend
+- direct mention replies and voice-channel replies use the same provider selection flow
+
+Important caveat:
+
+- Discord voice receive is better than the old 2025 setup, but it is still not fully clean on current Discord voice protocol changes. This repo includes local compatibility patches so the bot can join, listen, and often respond, but `discord-ext-voice-recv` may still drop undecodable incoming packets on some runs.
+
+## Features
+
+- LM Studio chat via OpenAI-compatible local server
+- Inworld streaming TTS for low-latency speech output
+- Piper fallback TTS
+- Discord text replies and voice-channel replies
+- Whisper-based transcription for voice input
+- optional memory store with fail-open behavior if embedding dependencies are broken
 
 ## Prerequisites
 
-- **Python 3.8+** 
-- **LM Studio** with a loaded chat model and local server enabled
-- **Discord Bot Token** from [Discord Developer Portal](https://discord.com/developers/applications)
-- **Inworld TTS API key** for streaming speech
-- **Git** for installation
+- Python 3.8+
+- Git
+- LM Studio with a model loaded and local server enabled at `http://127.0.0.1:1234/v1`
+- Discord bot token if you want to run the Discord bot
+- Inworld API key if you want streaming TTS
+- `ffmpeg` on `PATH` for voice/audio processing
 
----
+## Install
 
-## Quick Installation (Windows)
-
-### 1. Clone Repository
 ```bash
-git clone https://github.com/xsploit/Discord-AI-Voicebot.git
-cd Discord-AI-Voicebot
-```
-
-### 2. Set Up Virtual Environment
-```bash
+git clone https://github.com/xsploit/Discord-AI-Voicebot-v2.git
+cd Discord-AI-Voicebot-v2
 python -m venv .venv
 .venv\Scripts\activate
+python -m pip install -r requirements.txt
 ```
 
-### 3. Install Dependencies (Easy Method)
+If you need CUDA PyTorch for local embedding or other GPU-backed pieces:
+
 ```bash
-# Install exact working versions
-pip install -r requirements.txt
-
-# Install PyTorch with CUDA support (for RTX GPUs)
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 ```
 
-### 4. Configure Environment
-Copy `.env.example` to `.env` and set your Discord token, LM Studio settings, and Inworld TTS key.
+## Environment
 
-### 5. Start LM Studio
-Load your model in LM Studio, then start the local server. The default config in `.env.example` expects `http://127.0.0.1:1234/v1`.
+Copy `.env.example` to `.env`.
 
----
+Current defaults are:
 
-## Running the Bot
+```env
+LLM_PROVIDER=lmstudio
+TTS_PROVIDER=inworld
+LM_STUDIO_BASE_URL=http://127.0.0.1:1234/v1
+LM_STUDIO_MODEL=
+LM_STUDIO_API_KEY=lm-studio
+INWORLD_TTS_MODEL_ID=inworld-tts-1.5-max
+INWORLD_TTS_SAMPLE_RATE_HZ=48000
+```
+
+Token notes:
+
+- the bot accepts either `DISCORD_BOT_TOKEN` or `DISCORD_TOKEN`
+- if `LM_STUDIO_MODEL` is blank, the first model returned by `/v1/models` is used
+- if `TTS_PROVIDER=piper`, the local Piper paths in `Main.py` are used
+
+## Run The Discord Bot
+
+Start LM Studio first, make sure a model is loaded, then run:
 
 ```bash
 python Main.py
 ```
 
-You should see:
-```
-Bot ready: Hikari-chan#1234
-Commands: !vc, !stop, !die
-```
+Main commands:
 
----
+- `!vc` joins your current voice channel
+- `!stop` disconnects from voice
+- `!die` shuts the bot down
+- `@mention` triggers a text reply
 
-## Standalone Talking Avatar
+## Discord Voice Notes
 
-There is also a standalone PSD-based talking avatar renderer in [talking_avatar.py](/C:/Users/SUBSECT/Documents/GitHub/dvb/talking_avatar.py). This does not use Discord. It reuses the same LLM and TTS provider setup from this repo, then animates `mouth_open` and `mouth_closed` PSD layers from audio loudness.
+Current behavior:
 
-PSD setup:
-- Keep the full avatar in one PSD.
-- Put the open mouth on a layer named `mouth_open`.
-- Put the closed mouth on a layer named `mouth_closed`.
-- Leave every other layer in the PSD visible as normal.
+- voice connect and playback are updated for newer Discord voice changes
+- receive-side packet handling is patched locally to avoid hard crashes on some undecodable packets
+- the bot can still log dropped packet warnings during voice receive
 
-Example commands:
-
-```bash
-# Generate text with LM Studio, synthesize speech, and render an MP4
-python talking_avatar.py --psd path/to/avatar.psd --prompt "Introduce yourself as Jim Lahey"
-
-# Skip the LLM and speak explicit text
-python talking_avatar.py --psd path/to/avatar.psd --text "Cheers, bud."
-
-# Use an existing audio file instead of TTS
-python talking_avatar.py --psd path/to/avatar.psd --audio path/to/line.wav
-```
-
-The script writes:
-- `output/*.mp4` video
-- matching `.txt` reply text when text was generated
-- matching copied audio file next to the video
-
-Requirements for this path:
-- `ffmpeg` on `PATH`
-- `Pillow`
-- `psd-tools`
-- the same `.env` LLM/TTS settings already used by the bot
-
----
-
-## Commands
-
-- **!vc** - Join voice channel and start listening
-- **!stop** - Disconnect from voice  
-- **!die** - Shutdown bot
-- **@mention** - Chat with AI in text channels
-
----
+If the bot joins and replies but transcription quality is inconsistent, that is usually receive-side packet corruption in `discord-ext-voice-recv`, not LM Studio or Inworld.
 
 ## Troubleshooting
 
-### Voice Connection Issues
-If you get 4006 errors, make sure you installed the latest discord.py:
+### LM Studio
+
+Check that LM Studio is actually serving a model:
+
 ```bash
-python -c "import discord; print('Discord.py version:', discord.__version__)"
+python -c "import json, urllib.request; print(json.load(urllib.request.urlopen('http://127.0.0.1:1234/v1/models')))"
 ```
-Should show version `2.6.0a5254` or newer.
 
-### TTS Issues  
-If you use Inworld, verify `INWORLD_TTS_API_KEY` and the selected voice/model IDs. If you switch back to Piper, make sure the paths in `Main.py` still point to your local Piper files.
+If the configured model name does not match, set `LM_STUDIO_MODEL` explicitly in `.env`.
 
-### Model Issues
-If LM Studio is serving a different model, set `LM_STUDIO_MODEL` in `.env`. If left empty, the bot will use the first loaded model returned by LM Studio.
+### Inworld TTS
 
----
+If TTS fails:
 
-## What's New (August 2025)
+- verify `INWORLD_TTS_API_KEY`
+- verify `INWORLD_TTS_VOICE_ID`
+- verify `INWORLD_TTS_MODEL_ID`
 
-- ✅ **Fixed Discord 4006 errors** - Updated to latest discord.py with voice fix
-- 🎯 **Simplified voice connection** - More reliable voice channel joining  
-- 🧠 **Enhanced AI memory** - Better conversation context
-- 🔧 **Improved error handling** - Better debugging and retry logic
+### Piper
 
----
+If you switch to Piper:
 
-## Contributing
+- verify the executable path exists
+- verify the `.onnx` model path exists
+- verify the `.onnx.json` config path exists
 
-Feel free to open issues or submit pull requests!
+### Memory Store
 
----
+If `sentence-transformers`, `torch`, or `torchvision` are mismatched, the bot now degrades gracefully and disables memory embeddings instead of crashing startup.
+
+## Files
+
+- `Main.py`: Discord bot
+- `.env.example`: example provider config
+- `requirements.txt`: primary install file
 
 ## License
 
-This project is licensed under the MIT License.
+MIT

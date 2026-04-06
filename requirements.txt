@@ -2,8 +2,8 @@
 # Generated from working installation
 
 # Core Discord libraries (with 4006 voice fix)
-git+https://github.com/Rapptz/discord.py@13432591c6a7b095cb8daec687667c69a3469d95
-git+https://github.com/imayhaveborkedit/discord-ext-voice-recv
+git+https://github.com/Rapptz/discord.py@5d74ed3e0ce5178cf454825bd5a71f0248738f54
+git+https://github.com/imayhaveborkedit/discord-ext-voice-recv@ac04ea7b0941112e83767cf1c1469b408fa06748
 
 # Core dependencies - exact working versions
 ollama==0.4.5
@@ -14,6 +14,8 @@ aiohttp==3.12.15
 faster-whisper==1.2.0
 python-dotenv==1.0.1
 transformers==4.48.0
+Pillow==11.1.0
+psd-tools==1.14.2
 
 # GPU-accelerated PyTorch (install separately)
 # Run: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121

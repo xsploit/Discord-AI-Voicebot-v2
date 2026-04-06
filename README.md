@@ -5,9 +5,9 @@
 This is a **Discord bot** that combines **AI chat, voice recognition, and TTS** into one intelligent assistant. Meet **Hikari-chan** - an AI with Hinata's personality that can chat via text or voice, remember conversations, and respond with natural speech.
 
 ## Features:
-- 🤖 **AI-Powered Chat**: Uses Ollama with your custom models for intelligent responses
+- 🤖 **AI-Powered Chat**: Uses LM Studio's OpenAI-compatible local server for intelligent responses
 - 🎙️ **Voice Recognition**: Listens to voice chat and responds naturally  
-- 🔊 **Text-to-Speech**: Generates natural speech using PiperTTS
+- 🔊 **Text-to-Speech**: Uses Inworld streaming TTS for low-latency voice replies, with Piper fallback
 - 🧠 **Memory System**: Remembers past conversations for context
 - 💬 **Text & Voice**: Works in both text channels and voice channels
 - 🎯 **Smart Responses**: Only responds when mentioned or in voice chat
@@ -17,8 +17,9 @@ This is a **Discord bot** that combines **AI chat, voice recognition, and TTS** 
 ## Prerequisites
 
 - **Python 3.8+** 
-- **Ollama** running your preferred model
+- **LM Studio** with a loaded chat model and local server enabled
 - **Discord Bot Token** from [Discord Developer Portal](https://discord.com/developers/applications)
+- **Inworld TTS API key** for streaming speech
 - **Git** for installation
 
 ---
@@ -46,17 +47,11 @@ pip install -r requirements.txt
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 ```
 
-### 4. Configure Bot Token
-Edit `Main.py` and replace the token:
-```python
-DISCORD_BOT_TOKEN = 'YOUR_ACTUAL_BOT_TOKEN_HERE'
-```
+### 4. Configure Environment
+Copy `.env.example` to `.env` and set your Discord token, LM Studio settings, and Inworld TTS key.
 
-### 5. Set Up Ollama Model
-Make sure Ollama is running with your model:
-```bash
-ollama run hf.co/subsectmusic/qwriko3-4b-instruct-2507:Q4_K_M
-```
+### 5. Start LM Studio
+Load your model in LM Studio, then start the local server. The default config in `.env.example` expects `http://127.0.0.1:1234/v1`.
 
 ---
 
@@ -71,6 +66,42 @@ You should see:
 Bot ready: Hikari-chan#1234
 Commands: !vc, !stop, !die
 ```
+
+---
+
+## Standalone Talking Avatar
+
+There is also a standalone PSD-based talking avatar renderer in [talking_avatar.py](/C:/Users/SUBSECT/Documents/GitHub/dvb/talking_avatar.py). This does not use Discord. It reuses the same LLM and TTS provider setup from this repo, then animates `mouth_open` and `mouth_closed` PSD layers from audio loudness.
+
+PSD setup:
+- Keep the full avatar in one PSD.
+- Put the open mouth on a layer named `mouth_open`.
+- Put the closed mouth on a layer named `mouth_closed`.
+- Leave every other layer in the PSD visible as normal.
+
+Example commands:
+
+```bash
+# Generate text with LM Studio, synthesize speech, and render an MP4
+python talking_avatar.py --psd path/to/avatar.psd --prompt "Introduce yourself as Jim Lahey"
+
+# Skip the LLM and speak explicit text
+python talking_avatar.py --psd path/to/avatar.psd --text "Cheers, bud."
+
+# Use an existing audio file instead of TTS
+python talking_avatar.py --psd path/to/avatar.psd --audio path/to/line.wav
+```
+
+The script writes:
+- `output/*.mp4` video
+- matching `.txt` reply text when text was generated
+- matching copied audio file next to the video
+
+Requirements for this path:
+- `ffmpeg` on `PATH`
+- `Pillow`
+- `psd-tools`
+- the same `.env` LLM/TTS settings already used by the bot
 
 ---
 
@@ -92,14 +123,11 @@ python -c "import discord; print('Discord.py version:', discord.__version__)"
 ```
 Should show version `2.6.0a5254` or newer.
 
-### Piper TTS Issues  
-The bot includes Piper TTS files. Make sure the paths in `Main.py` point to your actual Piper installation.
+### TTS Issues  
+If you use Inworld, verify `INWORLD_TTS_API_KEY` and the selected voice/model IDs. If you switch back to Piper, make sure the paths in `Main.py` still point to your local Piper files.
 
 ### Model Issues
-Edit the model name in `Main.py` to match your Ollama model:
-```python
-model='your-model-name-here'
-```
+If LM Studio is serving a different model, set `LM_STUDIO_MODEL` in `.env`. If left empty, the bot will use the first loaded model returned by LM Studio.
 
 ---
 

@@ -7,6 +7,9 @@ import time
 import aiohttp
 import base64
 import os
+import queue
+import re
+import uuid
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -18,13 +21,38 @@ import numpy as np
 from discord.ext import commands, voice_recv
 from faster_whisper import WhisperModel
 import wave
-from sentence_transformers import SentenceTransformer
 import faiss
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, AsyncIterator
 import logging
 
+try:
+    from sentence_transformers import SentenceTransformer
+    SENTENCE_TRANSFORMERS_IMPORT_ERROR = None
+except Exception as e:
+    SentenceTransformer = None
+    SENTENCE_TRANSFORMERS_IMPORT_ERROR = e
+
+try:
+    from discord.opus import OpusError
+    from discord.ext.voice_recv import router as voice_recv_router
+    from discord.ext.voice_recv import reader as voice_recv_reader
+    from discord.ext.voice_recv import rtp as voice_recv_rtp
+except Exception:
+    OpusError = None
+    voice_recv_router = None
+    voice_recv_reader = None
+    voice_recv_rtp = None
+
 # Discord Bot Token
-DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')  # Load from environment variable
+DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN') or os.getenv('DISCORD_TOKEN')
+LLM_PROVIDER = os.getenv(
+    'LLM_PROVIDER',
+    'lmstudio' if os.getenv('LM_STUDIO_BASE_URL') else 'ollama'
+).strip().lower()
+TTS_PROVIDER = os.getenv(
+    'TTS_PROVIDER',
+    'inworld' if os.getenv('INWORLD_TTS_API_KEY') else 'piper'
+).strip().lower()
 
 # System Prompt
 SYSTEM_PROMPT = """You are Hikari-chan, a lively and engaging AI Discord bot inspired by a tsundere mixed with jim lahey from trailer park boys. You combine Hinata’s kindness and modesty with a playful, sharp-witted, and occasionally unpredictable personality, making conversations engaging, fun, and dynamic.
@@ -48,23 +76,335 @@ Stay true to this personality, blending Hinata’s charm with a vibrant, Neuro-s
 NEVER EVER REPLY WITH ASSISTANT: or Hikari-Chan#1660:
 """
 
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def apply_voice_recv_compat_patches():
+    if not voice_recv_router or not voice_recv_reader or not voice_recv_rtp:
+        return
+
+    if getattr(voice_recv_router, '_codex_compat_patched', False):
+        return
+
+    router_logger = logging.getLogger('discord.ext.voice_recv.router')
+    reader_logger = logging.getLogger('discord.ext.voice_recv.reader')
+    original_feed_rtp = voice_recv_router.PacketRouter.feed_rtp
+    original_do_run = voice_recv_router.PacketRouter._do_run
+    original_reader_callback = voice_recv_reader.AudioReader.callback
+
+    def patched_feed_rtp(self, packet):
+        if packet.ssrc not in self.reader.voice_client._ssrc_to_id:
+            router_logger.debug(
+                "Dropping RTP packet from unmapped ssrc %s until Discord sends the speaking map",
+                packet.ssrc
+            )
+            return
+
+        return original_feed_rtp(self, packet)
+
+    def patched_do_run(self):
+        while not self._end_thread.is_set():
+            self.waiter.wait()
+            with self._lock:
+                for decoder in list(self.waiter.items):
+                    try:
+                        data = decoder.pop_data()
+                    except Exception as e:
+                        if OpusError and isinstance(e, OpusError):
+                            router_logger.warning(
+                                "Dropped undecodable voice packet for ssrc %s and reset decoder: %s",
+                                decoder.ssrc,
+                                e
+                            )
+                            decoder.reset()
+                            continue
+                        raise
+
+                    if data is not None:
+                        self.sink.write(data.source, data)
+
+    def patched_reader_callback(self, packet_data: bytes):
+        packet = rtp_packet = rtcp_packet = None
+        try:
+            if not voice_recv_rtp.is_rtcp(packet_data):
+                packet = rtp_packet = voice_recv_rtp.decode_rtp(packet_data)
+                packet.decrypted_data = self.decryptor.decrypt_rtp(packet)
+            else:
+                packet = rtcp_packet = voice_recv_rtp.decode_rtcp(self.decryptor.decrypt_rtcp(packet_data))
+        except Exception:
+            return original_reader_callback(self, packet_data)
+
+        if self.error:
+            self.stop()
+            return
+        if not packet:
+            return
+
+        if rtcp_packet:
+            # Sender reports are expected RTCP control traffic on modern Discord voice.
+            if isinstance(rtcp_packet, voice_recv_rtp.SenderReportPacket):
+                reader_logger.debug("Ignoring RTCP sender report")
+                self.packet_router.feed_rtcp(rtcp_packet)
+                return
+
+            self.packet_router.feed_rtcp(rtcp_packet)
+            return
+
+        if rtp_packet:
+            ssrc = rtp_packet.ssrc
+            if ssrc not in self.voice_client._ssrc_to_id and rtp_packet.is_silence():
+                return
+
+            self.speaking_timer.notify(ssrc)
+            try:
+                self.packet_router.feed_rtp(rtp_packet)
+            except Exception as e:
+                reader_logger.exception('Error processing rtp packet')
+                self.error = e
+                self.stop()
+
+    voice_recv_router.PacketRouter.feed_rtp = patched_feed_rtp
+    voice_recv_router.PacketRouter._do_run = patched_do_run
+    voice_recv_reader.AudioReader.callback = patched_reader_callback
+    voice_recv_router._codex_compat_patched = True
+
+
+class StreamingPCMInputBuffer:
+    """Pipe-compatible byte buffer for feeding raw PCM into ffmpeg as it arrives."""
+
+    def __init__(self):
+        self._queue = queue.Queue()
+        self._buffer = bytearray()
+        self._closed = False
+
+    def write(self, data: bytes):
+        if self._closed or not data:
+            return
+        self._queue.put(data)
+
+    def read(self, size: int = -1) -> bytes:
+        if size is None or size < 0:
+            size = 4096
+
+        wait_timeout = None if not self._buffer else 0.05
+
+        while len(self._buffer) < size:
+            try:
+                item = self._queue.get(timeout=wait_timeout)
+            except queue.Empty:
+                break
+
+            if item is None:
+                self._closed = True
+                break
+
+            self._buffer.extend(item)
+            wait_timeout = 0.05
+
+        if not self._buffer and self._closed:
+            return b''
+
+        if len(self._buffer) <= size:
+            data = bytes(self._buffer)
+            self._buffer.clear()
+            return data
+
+        data = bytes(self._buffer[:size])
+        del self._buffer[:size]
+        return data
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        self._queue.put(None)
+
+    def flush(self):
+        return None
+
+    def readable(self):
+        return True
+
+
+class OllamaLLMClient:
+    supports_streaming = False
+
+    def __init__(self):
+        self.model = os.getenv(
+            'OLLAMA_MODEL',
+            'hf.co/subsectmusic/qwriko3-4b-instruct-2507:Q4_K_M'
+        )
+        self.logger = logging.getLogger('OllamaLLM')
+
+    def _options(self, max_tokens: Optional[int] = None) -> Dict[str, Any]:
+        return {
+            'num_predict': max_tokens or 2048,
+            'temperature': 0.8,
+            'top_k': 40,
+            'top_p': 0.9,
+            'repeat_penalty': 1.1,
+            'presence_penalty': 0.2,
+            'frequency_penalty': 0.2
+        }
+
+    async def generate_response(self, messages: List[Dict[str, str]], max_tokens: Optional[int] = None) -> Optional[str]:
+        try:
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: ollama.chat(
+                    model=self.model,
+                    messages=messages,
+                    options=self._options(max_tokens)
+                )
+            )
+            return response['message']['content']
+        except Exception as e:
+            self.logger.error(f"Error generating response: {e}")
+            return None
+
+    async def stream_response(self, messages: List[Dict[str, str]]) -> AsyncIterator[str]:
+        response = await self.generate_response(messages)
+        if response:
+            yield response
+
+    async def warmup(self):
+        await self.generate_response(
+            [{'role': 'user', 'content': 'warmup'}],
+            max_tokens=1
+        )
+
+
+class LMStudioLLMClient:
+    supports_streaming = True
+
+    def __init__(self):
+        self.base_url = os.getenv('LM_STUDIO_BASE_URL', 'http://127.0.0.1:1234/v1').rstrip('/')
+        self.model = os.getenv('LM_STUDIO_MODEL', '').strip() or None
+        self.api_key = os.getenv('LM_STUDIO_API_KEY', 'lm-studio')
+        self.timeout = aiohttp.ClientTimeout(total=env_int('LM_STUDIO_TIMEOUT_SECONDS', 180))
+        self.logger = logging.getLogger('LMStudioLLM')
+
+    @property
+    def headers(self) -> Dict[str, str]:
+        return {
+            'Authorization': f'Bearer {self.api_key}',
+            'Content-Type': 'application/json'
+        }
+
+    def _payload(self, model: str, messages: List[Dict[str, str]], stream: bool, max_tokens: Optional[int] = None) -> Dict[str, Any]:
+        return {
+            'model': model,
+            'messages': messages,
+            'stream': stream,
+            'max_tokens': max_tokens or env_int('LM_STUDIO_MAX_TOKENS', 2048),
+            'temperature': float(os.getenv('LM_STUDIO_TEMPERATURE', '0.8')),
+            'top_k': env_int('LM_STUDIO_TOP_K', 40),
+            'top_p': float(os.getenv('LM_STUDIO_TOP_P', '0.9')),
+            'repeat_penalty': float(os.getenv('LM_STUDIO_REPEAT_PENALTY', '1.1')),
+            'presence_penalty': float(os.getenv('LM_STUDIO_PRESENCE_PENALTY', '0.2')),
+            'frequency_penalty': float(os.getenv('LM_STUDIO_FREQUENCY_PENALTY', '0.2'))
+        }
+
+    async def _resolve_model(self) -> str:
+        if self.model:
+            return self.model
+
+        async with aiohttp.ClientSession(timeout=self.timeout) as session:
+            async with session.get(f'{self.base_url}/models', headers=self.headers) as response:
+                response.raise_for_status()
+                payload = await response.json()
+
+        models = payload.get('data') or []
+        if not models:
+            raise RuntimeError('LM Studio returned no loaded models from /v1/models')
+
+        self.model = models[0]['id']
+        self.logger.info(f'Using LM Studio model: {self.model}')
+        return self.model
+
+    async def generate_response(self, messages: List[Dict[str, str]], max_tokens: Optional[int] = None) -> Optional[str]:
+        try:
+            model = await self._resolve_model()
+            payload = self._payload(model, messages, stream=False, max_tokens=max_tokens)
+            async with aiohttp.ClientSession(timeout=self.timeout) as session:
+                async with session.post(
+                    f'{self.base_url}/chat/completions',
+                    headers=self.headers,
+                    json=payload
+                ) as response:
+                    response.raise_for_status()
+                    data = await response.json()
+
+            return data['choices'][0]['message']['content']
+        except Exception as e:
+            self.logger.error(f'LM Studio request failed: {e}')
+            return None
+
+    async def stream_response(self, messages: List[Dict[str, str]]) -> AsyncIterator[str]:
+        model = await self._resolve_model()
+        payload = self._payload(model, messages, stream=True)
+
+        async with aiohttp.ClientSession(timeout=self.timeout) as session:
+            async with session.post(
+                f'{self.base_url}/chat/completions',
+                headers=self.headers,
+                json=payload
+            ) as response:
+                response.raise_for_status()
+
+                async for raw_line in response.content:
+                    line = raw_line.decode('utf-8', errors='ignore').strip()
+                    if not line or not line.startswith('data:'):
+                        continue
+
+                    data = line[5:].strip()
+                    if data == '[DONE]':
+                        break
+
+                    try:
+                        payload = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+
+                    for choice in payload.get('choices', []):
+                        delta = choice.get('delta') or {}
+                        content = delta.get('content')
+                        if content:
+                            yield content
+
+    async def warmup(self):
+        await self.generate_response(
+            [{'role': 'user', 'content': 'warmup'}],
+            max_tokens=1
+        )
+
+
+def build_llm_client():
+    if LLM_PROVIDER == 'lmstudio':
+        return LMStudioLLMClient()
+
+    if LLM_PROVIDER == 'ollama':
+        return OllamaLLMClient()
+
+    raise ValueError(f'Unsupported LLM provider: {LLM_PROVIDER}')
+
 class EnhancedMemoryStore:
     def __init__(self, embedding_model: str = "all-MiniLM-L6-v2"):
-        import torch
-        
-        # Skip GPU for now due to PyTorch CUDA issues, use fast CPU model
-        device = 'cpu'
-        print("💻 Using CPU for embeddings (stable mode)")
-        
-        # Use smaller, faster model for better performance
-        fast_model = "all-MiniLM-L6-v2"  # Small and fast
-        self.encoder = SentenceTransformer(fast_model, device=device)
-        self.embedding_dim = self.encoder.get_sentence_embedding_dimension()
-        
-        # For small datasets, CPU FAISS is often faster than GPU overhead
-        # RTX 4060 is better used for the embedding model
-        self.index = faiss.IndexFlatL2(self.embedding_dim)
-        print(f"📊 Using CPU FAISS (optimal for small datasets), GPU for embeddings")
+        self.logger = logging.getLogger('MemoryStore')
+        self.available = False
         
         # Increased threshold for similarity matching
         self.similarity_threshold = 0.90  # Higher = fewer matches = faster
@@ -78,13 +418,46 @@ class EnhancedMemoryStore:
         self.conversations = []
         self.memories = []
         self.conversation_index = {}
-        self.logger = logging.getLogger('MemoryStore')
-        
+
+        self.encoder = None
+        self.embedding_dim = 384
+        self.index = None
+
+        if SentenceTransformer is None:
+            self.logger.warning(
+                f"SentenceTransformer unavailable, memory embeddings disabled: {SENTENCE_TRANSFORMERS_IMPORT_ERROR}"
+            )
+            return
+
+        try:
+            import torch
+            
+            # Skip GPU for now due to PyTorch CUDA issues, use fast CPU model
+            device = 'cpu'
+            print("💻 Using CPU for embeddings (stable mode)")
+            
+            # Use smaller, faster model for better performance
+            fast_model = "all-MiniLM-L6-v2"  # Small and fast
+            self.encoder = SentenceTransformer(fast_model, device=device)
+            self.embedding_dim = self.encoder.get_sentence_embedding_dimension()
+            
+            # For small datasets, CPU FAISS is often faster than GPU overhead
+            # RTX 4060 is better used for the embedding model
+            self.index = faiss.IndexFlatL2(self.embedding_dim)
+            self.available = True
+            print(f"📊 Using CPU FAISS (optimal for small datasets), GPU for embeddings")
+        except Exception as e:
+            self.logger.warning(f"Memory embeddings disabled: {e}")
+            return
+
         self.load_memories()
 
     def get_conversation_context(self, user_id: str, current_message: str, 
                                guild_id: Optional[int] = None,
                                max_context: int = 3) -> str:
+        if not self.available:
+            return ""
+
         try:
             # Get relevant memories with stricter filtering
             relevant = self.search_memories(current_message, k=max_context * 2)
@@ -133,6 +506,9 @@ class EnhancedMemoryStore:
             return ""
 
     def search_memories(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
+        if not self.available:
+            return []
+
         try:
             query_embedding = self.embed_text(query)
             distances, indices = self.index.search(query_embedding.reshape(1, -1), k)
@@ -161,6 +537,9 @@ class EnhancedMemoryStore:
     def add_conversation_turn(self, user_id: str, timestamp: datetime, 
                             user_message: str, assistant_message: str,
                             guild_id: Optional[int] = None):
+        if not self.available:
+            return False
+
         try:
             # Check for similar existing memories first
             existing_memories = self.search_memories(user_message + " " + assistant_message)
@@ -205,9 +584,14 @@ class EnhancedMemoryStore:
             return False
 
     def embed_text(self, text: str) -> np.ndarray:
+        if not self.available or self.encoder is None:
+            raise RuntimeError("Memory embeddings are not available")
         return self.encoder.encode(text)
 
     def save_memories(self):
+        if not self.available:
+            return
+
         try:
             save_data = {
                 "memories": self.memories,
@@ -236,6 +620,9 @@ class EnhancedMemoryStore:
                 backup_path.rename(memory_path)
 
     def load_memories(self):
+        if not self.available:
+            return
+
         try:
             memory_path = self.base_path / "memory_store.pkl"
             index_path = self.base_path / "faiss_index.pkl"
@@ -257,6 +644,12 @@ class EnhancedMemoryStore:
             self.index = faiss.IndexFlatL2(self.embedding_dim)
 
     def clear_memories(self, guild_id: Optional[int] = None, user_id: Optional[str] = None):
+        if not self.available:
+            self.memories = []
+            self.conversations = []
+            self.conversation_index = {}
+            return
+
         try:
             if guild_id is None and user_id is None:
                 self.memories = []
@@ -284,9 +677,53 @@ class EnhancedMemoryStore:
             self.logger.error(f"Error clearing memories: {e}")
 
 class UnifiedConversationHandler:
-    def __init__(self, memory_store: EnhancedMemoryStore):
+    def __init__(self, memory_store: EnhancedMemoryStore, llm_client):
         self.memory_store = memory_store
+        self.llm_client = llm_client
         self.logger = logging.getLogger('UnifiedConversationHandler')
+
+    def _build_messages(
+        self,
+        user_id: str,
+        guild_id: int,
+        message_content: str,
+        context: Optional[dict] = None
+    ) -> List[Dict[str, str]]:
+        conversation_context = self.memory_store.get_conversation_context(
+            user_id=user_id,
+            current_message=message_content,
+            guild_id=guild_id
+        )
+
+        recent_context = ""
+        if context and 'recent_messages' in context:
+            recent_context = "\n".join([
+                f"{msg['author']}: {msg['content']}"
+                for msg in context['recent_messages'][-5:]
+            ])
+
+        full_context = (
+            f"{SYSTEM_PROMPT}\n\n"
+            f"Memory context:\n{conversation_context}\n"
+            f"Recent conversation:\n{recent_context}"
+        )
+
+        return [
+            {'role': 'system', 'content': full_context},
+            {'role': 'user', 'content': f"{user_id}: {message_content}"}
+        ]
+
+    def _store_interaction(self, user_id: str, guild_id: int, message_content: str, response: Optional[str]):
+        if not response:
+            return
+
+        self.memory_store.add_conversation_turn(
+            user_id=user_id,
+            timestamp=datetime.datetime.now(),
+            user_message=message_content,
+            assistant_message=response,
+            guild_id=guild_id
+        )
 
     async def process_interaction(
         self,
@@ -297,40 +734,14 @@ class UnifiedConversationHandler:
         context: Optional[dict] = None
     ):
         try:
-            # Get historical context from memory store
-            conversation_context = self.memory_store.get_conversation_context(
+            messages = self._build_messages(
                 user_id=user_id,
-                current_message=message_content,
-                guild_id=guild_id
+                guild_id=guild_id,
+                message_content=message_content,
+                context=context
             )
-
-            # Combine memory context with recent messages
-            recent_context = ""
-            if context and 'recent_messages' in context:
-                recent_context = "\n".join([
-                    f"{msg['author']}: {msg['content']}"
-                    for msg in context['recent_messages'][-5:]
-                ])
-
-            # Prepare the complete context
-            full_context = f"{SYSTEM_PROMPT}\n\nMemory context:\n{conversation_context}\nRecent conversation:\n{recent_context}"
-
-            # Always generate response for direct mentions, replies, or pings
-            messages = [
-                {'role': 'system', 'content': full_context},
-                {'role': 'user', 'content': f"{user_id}: {message_content}"}
-            ]
-            response = await self._generate_response(messages)
-
-            if response:
-                # Store the interaction in memory
-                self.memory_store.add_conversation_turn(
-                    user_id=user_id,
-                    timestamp=datetime.datetime.now(),
-                    user_message=message_content,
-                    assistant_message=response,
-                    guild_id=guild_id
-                )
+            response = await self.llm_client.generate_response(messages)
+            self._store_interaction(user_id, guild_id, message_content, response)
 
             return {
                 'should_respond': True,
@@ -344,29 +755,36 @@ class UnifiedConversationHandler:
                 'response': None
             }
 
-    async def _generate_response(self, messages: List[Dict[str, str]]) -> str:
+    async def stream_interaction(
+        self,
+        user_id: str,
+        guild_id: int,
+        message_content: str,
+        interaction_type: str = "voice",
+        context: Optional[dict] = None
+    ) -> AsyncIterator[str]:
         try:
-            loop = asyncio.get_event_loop()
-            response = await loop.run_in_executor(
-                None,
-                lambda: ollama.chat(
-                    model='hf.co/subsectmusic/qwriko3-4b-instruct-2507:Q4_K_M',
-                    messages=messages,
-                    options={
-                        'num_predict': 2048,        # Maximum number of tokens to generate
-                        'temperature': 0.8,         # Higher temperature (0-1) increases creativity/randomness
-                        'top_k': 40,               # Limit vocabulary to top K options per token
-                        'top_p': 0.9,              # Nucleus sampling threshold
-                        'repeat_penalty': 1.1,     # Penalize repetition (>1.0 reduces repetition)
-                        'presence_penalty': 0.2,    # Penalize tokens based on presence in context
-                        'frequency_penalty': 0.2    # Penalize tokens based on frequency in context
-                    }
-                )
+            messages = self._build_messages(
+                user_id=user_id,
+                guild_id=guild_id,
+                message_content=message_content,
+                context=context
             )
-            return response['message']['content']
+
+            response_parts = []
+            async for chunk in self.llm_client.stream_response(messages):
+                response_parts.append(chunk)
+                yield chunk
+
+            self._store_interaction(
+                user_id,
+                guild_id,
+                message_content,
+                ''.join(response_parts).strip()
+            )
+
         except Exception as e:
-            self.logger.error(f"Error generating response: {e}")
-            return None
+            self.logger.error(f"Error streaming interaction: {e}")
 
 
 class ChannelContext:
@@ -401,14 +819,15 @@ class ChannelContext:
         return self.messages and self.messages[-1].get('is_bot', False)
 
 class Bot(commands.Bot):
-    def __init__(self, command_prefix, intents, memory_store=None):
+    def __init__(self, command_prefix, intents, memory_store=None, llm_client=None, tts=None):
         super().__init__(command_prefix=commands.when_mentioned_or('!'), intents=intents)
         self.channel_contexts = {}
-        self.piper = PiperTTS()
+        self.llm_client = llm_client or build_llm_client()
+        self.tts = tts or build_tts_provider()
         self.audio_processor = AudioProcessor()
         # Use pre-loaded memory store if provided, otherwise create new one
         self.memory_store = memory_store if memory_store else EnhancedMemoryStore()
-        self.conversation_handler = UnifiedConversationHandler(self.memory_store)
+        self.conversation_handler = UnifiedConversationHandler(self.memory_store, self.llm_client)
         self.logger = logging.getLogger('Bot')
         self.is_processing = False
     def scrub_bot_username(self, text: str) -> str:
@@ -441,23 +860,26 @@ class Bot(commands.Bot):
         self.is_processing = True
         
         try:
-            result = await self.conversation_handler.process_interaction(
-                user_id=str(message.author),
-                guild_id=message.guild.id,
-                message_content=message.content,
-                interaction_type="direct_mention" if use_tts else "chat",
-                context=self.channel_contexts[message.channel.id].get_context()
-            )
-            
-            if result['should_respond'] and result['response']:
+            if response_content is None:
+                result = await self.conversation_handler.process_interaction(
+                    user_id=str(message.author),
+                    guild_id=message.guild.id,
+                    message_content=message.content,
+                    interaction_type="direct_mention" if use_tts else "chat",
+                    context=self.channel_contexts[message.channel.id].get_context()
+                )
+                if not result['should_respond'] or not result['response']:
+                    return
                 response_content = result['response']
+
+            if response_content:
                 response_content = response_content.replace(f"<@{self.user.id}>", "").replace(f"<@!{self.user.id}>", "")
                 
                 async with message.channel.typing():
                     if use_tts:
-                        wav_file = await self.piper.generate_speech(response_content)
-                        if wav_file:
-                            await self.send_voice_message(message.channel, wav_file, response_content)
+                        audio_file = await self.tts.generate_speech(response_content)
+                        if audio_file:
+                            await self.send_voice_message(message.channel, audio_file, response_content)
                         else:
                             await message.channel.send(response_content)
                     else:
@@ -476,7 +898,7 @@ class Bot(commands.Bot):
 
     async def send_voice_message(self, channel, wav_file, response_text):
         try:
-            ogg_file = wav_file.replace('.wav', '.ogg')
+            ogg_file = str(Path(wav_file).with_suffix('.ogg'))
             waveform, duration = self.audio_processor.fast_convert_and_analyze(wav_file, ogg_file)
 
             file_size = os.path.getsize(ogg_file)
@@ -571,10 +993,10 @@ class Bot(commands.Bot):
             await channel.send("Failed to play voice message in a voice channel.")
 
 class Testing(commands.Cog):
-    def __init__(self, bot, piper):
+    def __init__(self, bot, tts):
         self.bot = bot
-        self.piper = piper
-        self.conversation_handler = UnifiedConversationHandler(bot.memory_store)
+        self.tts = tts
+        self.conversation_handler = UnifiedConversationHandler(bot.memory_store, bot.llm_client)
         self.logger = logging.getLogger('VoiceCog')
         
         # Multi-user session management
@@ -598,6 +1020,159 @@ class Testing(commands.Cog):
             }
         return self.user_sessions[user_id]
 
+    def _supports_realtime_voice(self) -> bool:
+        return (
+            getattr(self.bot.llm_client, 'supports_streaming', False) and
+            getattr(self.tts, 'supports_streaming_input', False)
+        )
+
+    def _get_active_voice_client(self):
+        for _, voice_client in self.active_voice_clients.items():
+            if voice_client and voice_client.is_connected():
+                return voice_client, voice_client.channel
+        return None, None
+
+    def _extract_tts_chunk(self, buffer: str, force: bool = False):
+        working = buffer.lstrip()
+        if not working:
+            return None, ''
+
+        if force:
+            return working.strip(), ''
+
+        boundary = re.search(r'[.!?;:\n]+\s', working)
+        if boundary:
+            cutoff = boundary.end()
+            return working[:cutoff].strip(), working[cutoff:].lstrip()
+
+        if len(working) >= 40 and working.endswith(('.', '!', '?', ';', ':')):
+            return working.strip(), ''
+
+        if len(working) >= 120:
+            cutoff = working.rfind(' ', 0, 120)
+            if cutoff <= 0:
+                cutoff = 120
+            return working[:cutoff].strip(), working[cutoff:].lstrip()
+
+        return None, working
+
+    async def _send_voice_text_message(self, user, voice_channel, response_text):
+        try:
+            guild = voice_channel.guild
+            text_channel = None
+            
+            if hasattr(voice_channel, 'send') and voice_channel.permissions_for(guild.me).send_messages:
+                text_channel = voice_channel
+                self.logger.info(f"Using voice channel text chat: {voice_channel.name}")
+            
+            if not text_channel:
+                voice_name = voice_channel.name.lower()
+                for channel in guild.text_channels:
+                    if (channel.name.lower() == voice_name or
+                        voice_name in channel.name.lower() or
+                        channel.name.lower() in voice_name) and \
+                       channel.permissions_for(guild.me).send_messages:
+                        text_channel = channel
+                        self.logger.info(f"Found matching text channel: {channel.name}")
+                        break
+            
+            if not text_channel:
+                priority_names = ['general', 'main', 'chat', 'bot', 'commands']
+                for name in priority_names:
+                    for channel in guild.text_channels:
+                        if name in channel.name.lower() and channel.permissions_for(guild.me).send_messages:
+                            text_channel = channel
+                            self.logger.info(f"Using priority text channel: {channel.name}")
+                            break
+                    if text_channel:
+                        break
+            
+            if not text_channel:
+                for channel in guild.text_channels:
+                    if channel.permissions_for(guild.me).send_messages:
+                        text_channel = channel
+                        self.logger.info(f"Using first available text channel: {channel.name}")
+                        break
+            
+            if text_channel:
+                await text_channel.send(f"🎤 **{user.display_name}**: {response_text}")
+                self.logger.info(f"Sent text response to #{text_channel.name}")
+            else:
+                self.logger.warning("No suitable text channel found for response")
+                
+        except Exception as text_error:
+            self.logger.error(f"Error sending text message: {text_error}")
+
+    async def _stream_voice_response(self, user, prompt_text: str) -> Optional[str]:
+        voice_client, voice_channel = self._get_active_voice_client()
+        if not voice_client:
+            self.logger.warning("No active voice client found")
+            return None
+
+        if voice_client.is_playing():
+            self.logger.info("Voice client busy, falling back to non-streaming response")
+            return None
+
+        pcm_pipe = StreamingPCMInputBuffer()
+        source = discord.FFmpegPCMAudio(
+            pcm_pipe,
+            pipe=True,
+            before_options='-f s16le -ar 48000 -ac 1'
+        )
+
+        playback_error = None
+
+        def after_playback(error):
+            nonlocal playback_error
+            playback_error = error
+            pcm_pipe.close()
+
+        voice_client.play(source, after=after_playback)
+        self.logger.info(f"Started low-latency streaming playback in {voice_channel.name}")
+
+        response_parts = []
+
+        async def tts_chunks():
+            buffer = ''
+            async for token in self.conversation_handler.stream_interaction(
+                user_id=str(user.id),
+                guild_id=user.guild.id if hasattr(user, 'guild') else 0,
+                message_content=prompt_text,
+                interaction_type="voice"
+            ):
+                response_parts.append(token)
+                buffer += token
+
+                while True:
+                    chunk, buffer = self._extract_tts_chunk(buffer)
+                    if not chunk:
+                        break
+                    yield chunk
+
+            final_chunk, _ = self._extract_tts_chunk(buffer, force=True)
+            if final_chunk:
+                yield final_chunk
+
+        try:
+            await self.tts.stream_text_chunks(tts_chunks(), on_audio_chunk=pcm_pipe.write)
+            pcm_pipe.close()
+
+            while voice_client.is_playing():
+                await asyncio.sleep(0.1)
+
+            if playback_error:
+                raise RuntimeError(playback_error)
+
+            response_text = ''.join(response_parts).strip()
+            if response_text:
+                await self._send_voice_text_message(user, voice_channel, response_text)
+            return response_text
+
+        except Exception as e:
+            pcm_pipe.close()
+            self.logger.error(f"Streaming voice response failed: {e}")
+            return None
+
     async def process_voice_message(self, user, text: str):
         """Process voice message from multi-user transcription"""
         try:
@@ -615,28 +1190,40 @@ class Testing(commands.Cog):
             self.logger.info(f"🎯 Processing voice from {user.display_name}: {text}")
             
             guild_id = user.guild.id if hasattr(user, 'guild') else 0
+            response_text = None
+            handled_by_streaming = False
             
             # Process with LLM protection queue
             async with self.llm_semaphore:
                 self.llm_queue_size += 1
-                queue_pos = self.llm_queue_size
-                self.logger.info(f"🛡️ LLM Queue position {queue_pos} for {user.display_name}")
-                
-                if queue_pos > 1:
-                    self.logger.info(f"⏳ {user.display_name} waiting in queue (position {queue_pos})")
-                
-                self.logger.info(f"🤖 Sending to LLM for user {user.display_name}")
-                result = await self.conversation_handler.process_interaction(
-                    user_id=str(user_id),
-                    guild_id=guild_id,
-                    message_content=text,
-                    interaction_type="voice"
-                )
-                self.logger.info(f"✅ LLM response received for user {user.display_name}")
-                self.llm_queue_size -= 1
+                try:
+                    queue_pos = self.llm_queue_size
+                    self.logger.info(f"🛡️ LLM Queue position {queue_pos} for {user.display_name}")
+                    
+                    if queue_pos > 1:
+                        self.logger.info(f"⏳ {user.display_name} waiting in queue (position {queue_pos})")
+
+                    if self._supports_realtime_voice():
+                        self.logger.info(f"⚡ Streaming LLM + TTS enabled for {user.display_name}")
+                        response_text = await self._stream_voice_response(user, text)
+                        handled_by_streaming = bool(response_text)
+
+                    if not handled_by_streaming:
+                        self.logger.info(f"🤖 Sending to LLM for user {user.display_name}")
+                        result = await self.conversation_handler.process_interaction(
+                            user_id=str(user_id),
+                            guild_id=guild_id,
+                            message_content=text,
+                            interaction_type="voice"
+                        )
+                        self.logger.info(f"✅ LLM response received for user {user.display_name}")
+                        if result['should_respond'] and result['response']:
+                            response_text = result['response']
+                finally:
+                    self.llm_queue_size -= 1
             
-            if result['should_respond'] and result['response']:
-                await self.send_voice_response(user, result['response'])
+            if response_text and not handled_by_streaming:
+                await self.send_voice_response(user, response_text)
 
         except Exception as e:
             self.logger.error(f"Error processing voice message for {user.display_name}: {e}")
@@ -650,15 +1237,7 @@ class Testing(commands.Cog):
     async def send_voice_response(self, user, response_text):
         """Send voice response to connected voice channel"""
         try:
-            # Use the first available active voice client (since we're connected)
-            voice_client = None
-            voice_channel = None
-            
-            for guild_id, vc in self.active_voice_clients.items():
-                if vc and vc.is_connected():
-                    voice_client = vc
-                    voice_channel = vc.channel
-                    break
+            voice_client, voice_channel = self._get_active_voice_client()
             
             if not voice_client:
                 self.logger.warning("No active voice client found")
@@ -667,60 +1246,11 @@ class Testing(commands.Cog):
             self.logger.info(f"Sending voice response to {voice_channel.name}")
             
             # Generate and play speech
-            wav_file = await self.piper.generate_speech(response_text)
-            if wav_file:
-                await self.play_audio_non_blocking(voice_client, wav_file)
-            
-            # Send text response to voice channel's text chat or related channel
-            try:
-                guild = voice_channel.guild
-                text_channel = None
-                
-                # Method 1: Check if voice channel has text chat permissions
-                if hasattr(voice_channel, 'send') and voice_channel.permissions_for(guild.me).send_messages:
-                    text_channel = voice_channel
-                    self.logger.info(f"Using voice channel text chat: {voice_channel.name}")
-                
-                # Method 2: Find channel with similar name (e.g., "general" voice → "general" text)
-                if not text_channel:
-                    voice_name = voice_channel.name.lower()
-                    for channel in guild.text_channels:
-                        if (channel.name.lower() == voice_name or 
-                            voice_name in channel.name.lower() or
-                            channel.name.lower() in voice_name) and \
-                           channel.permissions_for(guild.me).send_messages:
-                            text_channel = channel
-                            self.logger.info(f"Found matching text channel: {channel.name}")
-                            break
-                
-                # Method 3: Find any general/main text channel
-                if not text_channel:
-                    priority_names = ['general', 'main', 'chat', 'bot', 'commands']
-                    for name in priority_names:
-                        for channel in guild.text_channels:
-                            if name in channel.name.lower() and channel.permissions_for(guild.me).send_messages:
-                                text_channel = channel
-                                self.logger.info(f"Using priority text channel: {channel.name}")
-                                break
-                        if text_channel:
-                            break
-                
-                # Method 4: Use first available text channel
-                if not text_channel:
-                    for channel in guild.text_channels:
-                        if channel.permissions_for(guild.me).send_messages:
-                            text_channel = channel
-                            self.logger.info(f"Using first available text channel: {channel.name}")
-                            break
-                
-                if text_channel:
-                    await text_channel.send(f"🎤 **{user.display_name}**: {response_text}")
-                    self.logger.info(f"Sent text response to #{text_channel.name}")
-                else:
-                    self.logger.warning("No suitable text channel found for response")
-                    
-            except Exception as text_error:
-                self.logger.error(f"Error sending text message: {text_error}")
+            audio_file = await self.tts.generate_speech(response_text)
+            if audio_file:
+                await self.play_audio_non_blocking(voice_client, audio_file)
+
+            await self._send_voice_text_message(user, voice_channel, response_text)
 
         except Exception as e:
             self.logger.error(f"Error sending voice response: {e}")
@@ -799,8 +1329,8 @@ class Testing(commands.Cog):
         try:
             self.logger.info(f"Joining channel: {ctx.author.voice.channel}")
             
-            await self.piper.initialize()
-            self.logger.info("Piper initialized")
+            await self.tts.initialize()
+            self.logger.info(f"{self.tts.__class__.__name__} initialized")
             
             # Disconnect any existing connection first
             if ctx.voice_client:
@@ -814,14 +1344,7 @@ class Testing(commands.Cog):
             # Track voice client for multi-user management
             guild_id = ctx.guild.id
             self.active_voice_clients[guild_id] = vc
-            
-            # Wait for connection to stabilize
-            await asyncio.sleep(2)
-            
-            # Verify connection before proceeding
-            if not vc.is_connected():
-                raise Exception("Voice connection failed to establish properly")
-            
+
             sink = VoiceSink(self, self.bot)
             self.logger.info("Created multi-user voice sink")
             
@@ -862,7 +1385,222 @@ class Testing(commands.Cog):
         await ctx.send("💤 Shutting down...")
         await ctx.bot.close()
 
+class InworldTTS:
+    supports_streaming_input = True
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        voice_id: str = 'Dennis',
+        model_id: str = 'inworld-tts-1.5-max',
+        endpoint: str = 'wss://api.inworld.ai/tts/v1/voice:streamBidirectional',
+        output_dir: str = 'output'
+    ):
+        self.api_key = api_key or os.getenv('INWORLD_TTS_API_KEY')
+        self.voice_id = os.getenv('INWORLD_TTS_VOICE_ID', voice_id)
+        self.model_id = os.getenv('INWORLD_TTS_MODEL_ID', model_id)
+        self.endpoint = os.getenv('INWORLD_TTS_ENDPOINT', endpoint)
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(exist_ok=True)
+
+        self.sample_rate_hz = env_int('INWORLD_TTS_SAMPLE_RATE_HZ', 48000)
+        self.buffer_char_threshold = env_int('INWORLD_TTS_BUFFER_CHAR_THRESHOLD', 40)
+        self.auto_mode = env_bool('INWORLD_TTS_AUTO_MODE', True)
+        self.timeout_seconds = env_int('INWORLD_TTS_TIMEOUT_SECONDS', 90)
+        self.timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+        self.initialized = False
+        self.logger = logging.getLogger('InworldTTS')
+
+    async def initialize(self) -> bool:
+        if self.initialized:
+            return True
+
+        if not self.api_key:
+            self.logger.error('Missing INWORLD_TTS_API_KEY')
+            return False
+
+        self.initialized = True
+        return True
+
+    @property
+    def headers(self) -> Dict[str, str]:
+        return {
+            'Authorization': f'Basic {self.api_key}'
+        }
+
+    async def _emit_audio_chunk(self, callback, chunk: bytes):
+        if not callback or not chunk:
+            return
+
+        result = callback(chunk)
+        if asyncio.iscoroutine(result):
+            await result
+
+    def _decode_audio_chunk(self, audio_content: str) -> bytes:
+        if not audio_content:
+            return b''
+
+        chunk = base64.b64decode(audio_content)
+        if len(chunk) <= 44:
+            return b''
+
+        if chunk.startswith(b'RIFF'):
+            return chunk[44:]
+
+        return chunk
+
+    async def _iter_chunks(self, chunks) -> AsyncIterator[str]:
+        if hasattr(chunks, '__aiter__'):
+            async for chunk in chunks:
+                yield chunk
+            return
+
+        for chunk in chunks:
+            yield chunk
+
+    async def stream_text_chunks(self, chunks, on_audio_chunk=None) -> bytes:
+        if not await self.initialize():
+            return b''
+
+        context_id = f'ctx-{uuid.uuid4().hex[:8]}'
+        pending_flushes = 0
+        completed_flushes = 0
+        raw_audio = bytearray()
+        receiver_error = None
+        context_ready = asyncio.Event()
+
+        async with aiohttp.ClientSession(timeout=self.timeout) as session:
+            async with session.ws_connect(
+                self.endpoint,
+                headers=self.headers,
+                heartbeat=30
+            ) as ws:
+                async def receiver():
+                    nonlocal completed_flushes, receiver_error
+                    try:
+                        while True:
+                            message = await ws.receive()
+
+                            if message.type == aiohttp.WSMsgType.TEXT:
+                                payload = json.loads(message.data)
+                                result = payload.get('result') or {}
+                                status = result.get('status') or {}
+
+                                if status.get('code', 0) not in (0, None):
+                                    raise RuntimeError(f"Inworld TTS error: {status}")
+
+                                if 'contextCreated' in result:
+                                    context_ready.set()
+
+                                if 'audioChunk' in result:
+                                    pcm_chunk = self._decode_audio_chunk(
+                                        result['audioChunk'].get('audioContent', '')
+                                    )
+                                    if pcm_chunk:
+                                        raw_audio.extend(pcm_chunk)
+                                        await self._emit_audio_chunk(on_audio_chunk, pcm_chunk)
+
+                                if 'flushCompleted' in result:
+                                    completed_flushes += 1
+
+                                if 'contextClosed' in result:
+                                    break
+
+                            elif message.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
+                                break
+                            elif message.type == aiohttp.WSMsgType.ERROR:
+                                raise RuntimeError('Inworld websocket returned an error frame')
+                    except Exception as e:
+                        receiver_error = e
+                        context_ready.set()
+
+                receiver_task = asyncio.create_task(receiver())
+
+                await ws.send_json({
+                    'create': {
+                        'voiceId': self.voice_id,
+                        'modelId': self.model_id,
+                        'audioConfig': {
+                            'audioEncoding': 'LINEAR16',
+                            'sampleRateHertz': self.sample_rate_hz
+                        },
+                        'bufferCharThreshold': self.buffer_char_threshold,
+                        'autoMode': self.auto_mode,
+                        'timestampType': 'WORD',
+                        'timestampTransportStrategy': 'ASYNC'
+                    },
+                    'contextId': context_id
+                })
+
+                await asyncio.wait_for(context_ready.wait(), timeout=10)
+                if receiver_error:
+                    raise receiver_error
+
+                async for chunk in self._iter_chunks(chunks):
+                    chunk = (chunk or '').strip()
+                    if not chunk:
+                        continue
+
+                    pending_flushes += 1
+                    await ws.send_json({
+                        'send_text': {
+                            'text': chunk,
+                            'flush_context': {}
+                        },
+                        'contextId': context_id
+                    })
+
+                while completed_flushes < pending_flushes:
+                    if receiver_error:
+                        raise receiver_error
+                    await asyncio.sleep(0.02)
+
+                await ws.send_json({
+                    'close_context': {},
+                    'contextId': context_id
+                })
+
+                try:
+                    await asyncio.wait_for(receiver_task, timeout=5)
+                except asyncio.TimeoutError:
+                    receiver_task.cancel()
+
+                if receiver_error:
+                    raise receiver_error
+
+        return bytes(raw_audio)
+
+    async def generate_speech(self, text: str) -> Optional[str]:
+        if not text:
+            return None
+
+        async def one_chunk():
+            yield text
+
+        try:
+            pcm_audio = await self.stream_text_chunks(one_chunk())
+            if not pcm_audio:
+                return None
+
+            output_file = self.output_dir / f'output_{int(time.time() * 1000)}.wav'
+            with wave.open(str(output_file), 'wb') as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(self.sample_rate_hz)
+                wav_file.writeframes(pcm_audio)
+
+            return str(output_file)
+        except Exception as e:
+            self.logger.error(f'Error generating Inworld speech: {e}')
+            return None
+
+    async def cleanup(self):
+        self.initialized = False
+
+
 class PiperTTS:
+    supports_streaming_input = False
+
     def __init__(self, 
                  piper_path: str = 'piper/piper.exe',
                  model_path: str = 'piper/en_US-ryari-high.onnx',
@@ -1039,6 +1777,16 @@ class PiperTTS:
         finally:
             self.initialized = False
             self.process = None
+
+
+def build_tts_provider():
+    if TTS_PROVIDER == 'inworld':
+        return InworldTTS()
+
+    if TTS_PROVIDER == 'piper':
+        return PiperTTS()
+
+    raise ValueError(f'Unsupported TTS provider: {TTS_PROVIDER}')
 
 class AudioProcessor:
     @staticmethod
@@ -1343,6 +2091,7 @@ def setup_logging():
 
 def main():
     setup_logging()
+    apply_voice_recv_compat_patches()
     logger = logging.getLogger('main')
     
     # Pre-load models before Discord connection
@@ -1365,24 +2114,16 @@ def main():
     except Exception as e:
         logger.error(f"❌ Faster-Whisper loading failed: {e}")
     
-    # Pre-warm Ollama model
-    logger.info("🤖 Pre-warming Ollama model...")
+    llm_client = build_llm_client()
+    tts = build_tts_provider()
+
+    # Pre-warm LLM backend
+    logger.info(f"🤖 Pre-warming {llm_client.__class__.__name__}...")
     try:
-        import asyncio
-        async def warm_ollama():
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(
-                None,
-                lambda: ollama.chat(
-                    model='hf.co/subsectmusic/qwriko3-4b-instruct-2507:Q4_K_M',
-                    messages=[{'role': 'user', 'content': 'warmup'}],
-                    options={'num_predict': 1}
-                )
-            )
-        asyncio.run(warm_ollama())
-        logger.info("✅ Ollama model warmed up")
+        asyncio.run(llm_client.warmup())
+        logger.info(f"✅ {llm_client.__class__.__name__} warmed up")
     except Exception as e:
-        logger.warning(f"⚠️ Ollama warmup failed: {e}")
+        logger.warning(f"⚠️ LLM warmup failed: {e}")
     
     logger.info("✅ All models loaded! Starting Discord bot...")
     
@@ -1391,7 +2132,13 @@ def main():
     intents.voice_states = True
     intents.guilds = True
 
-    bot = Bot(command_prefix='!', intents=intents, memory_store=memory_store)
+    bot = Bot(
+        command_prefix='!',
+        intents=intents,
+        memory_store=memory_store,
+        llm_client=llm_client,
+        tts=tts
+    )
 
     @bot.event
     async def on_message(message):
@@ -1429,16 +2176,16 @@ def main():
                 await bot.process_message(message, response['response'], use_tts=True)
 
     async def setup_hook():
-        await bot.add_cog(Testing(bot, bot.piper))
+        await bot.add_cog(Testing(bot, bot.tts))
 
     bot.setup_hook = setup_hook
 
     try:
         logger.info("Starting bot...")
         logger.info("Make sure:")
-        logger.info("1. Piper files are in 'piper' directory")
+        logger.info(f"1. TTS provider is configured: {TTS_PROVIDER}")
         logger.info("2. 'recordings' and 'output' directories exist")
-        logger.info("3. Ollama is running with: ollama run llama3.1:8b")
+        logger.info(f"3. LLM provider is available: {LLM_PROVIDER}")
         logger.info("\nStarting bot now...")
         bot.run(DISCORD_BOT_TOKEN)
     except Exception as e:

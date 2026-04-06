@@ -17,6 +17,7 @@ What is current in this repo now:
 Important caveat:
 
 - Discord voice receive is better than the old 2025 setup, but it is still not fully clean on current Discord voice protocol changes. This repo includes local compatibility patches so the bot can join, listen, and often respond, but `discord-ext-voice-recv` may still drop undecodable incoming packets on some runs.
+- you do not need to manually patch installed packages for this repo; the local compatibility patching is applied at runtime from `Main.py`
 
 ## Features
 
@@ -45,6 +46,19 @@ python -m venv .venv
 .venv\Scripts\activate
 python -m pip install -r requirements.txt
 ```
+
+Windows quick setup:
+
+```powershell
+.\setup_bot.ps1
+```
+
+That script:
+
+- creates `.venv` unless you pass `-SkipVenv`
+- installs the pinned requirements
+- optionally installs CUDA PyTorch with `-InstallCudaTorch`
+- runs `doctor_bot.py` to verify the environment
 
 If you need CUDA PyTorch for local embedding or other GPU-backed pieces:
 
@@ -111,6 +125,20 @@ python -c "import json, urllib.request; print(json.load(urllib.request.urlopen('
 
 If the configured model name does not match, set `LM_STUDIO_MODEL` explicitly in `.env`.
 
+### Environment Doctor
+
+You can verify a machine with:
+
+```bash
+python doctor_bot.py
+```
+
+Or on Windows through:
+
+```powershell
+.\setup_bot.ps1
+```
+
 ### Inworld TTS
 
 If TTS fails:
@@ -134,6 +162,8 @@ If `sentence-transformers`, `torch`, or `torchvision` are mismatched, the bot no
 ## Files
 
 - `Main.py`: Discord bot
+- `setup_bot.ps1`: Windows setup helper
+- `doctor_bot.py`: environment verification script
 - `.env.example`: example provider config
 - `requirements.txt`: primary install file
 
